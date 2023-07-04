@@ -10,12 +10,10 @@ static uint8_t open_ct = 0;
 
 static struct PwmRegs pwm_regs;
 static uint32_t old_fsel;
-static uint32_t old_clockman_ctl;
-static uint32_t old_clockman_div;
 
 static bool enabled;
 
-#define delay_writel(a, b) {usleep_range(19000, 21000); writel(a, b);}
+#define delay_writel(a, b) writel(a, b) //{usleep_range(19000, 21000); writel(a, b);}
 
 static struct file_operations file_ops = {
     // set .owner so that we get auto lock/release
@@ -107,13 +105,11 @@ static int blaster_release(struct inode* ino, struct file* f) {
 }
 
 static void deinit_pwm(void) {
-    // restore old registers
-    ((struct ClockmanPwmctl*)&old_clockman_ctl)->passwd = CLOCKMAN_PASSWORD;
-    ((struct ClockmanPwmdiv*)&old_clockman_ctl)->passwd = CLOCKMAN_PASSWORD;
-    delay_writel(old_clockman_div, pwm_regs.cman_pwmdiv);
-    check_sta("after set old div");
-    delay_writel(old_clockman_ctl, pwm_regs.cman_pwmctl);
-    check_sta("after set old clock ctl");
+    // disable pwm at exit
+    struct Ctl c;
+    memset(&c, 0, sizeof(struct Ctl));
+    delay_writel(make_u32(c), pwm_regs.ctl);
+
     delay_writel(old_fsel, pwm_regs.gpfsel1);
     check_sta("after set old gpio");
 }
@@ -123,8 +119,6 @@ static void init_pwm(void) {
     uint32_t v;
 
     // save these for restoration later
-    old_clockman_div = readl(pwm_regs.cman_pwmdiv);
-    old_clockman_ctl = readl(pwm_regs.cman_pwmctl);
     old_fsel = readl(pwm_regs.gpfsel1);
 
     struct Fsel fs;
@@ -137,14 +131,6 @@ static void init_pwm(void) {
     delay_writel(make_u32(fs), pwm_regs.gpfsel1);
     check_sta("after set fsel");
 
-    struct ClockmanPwmctl cm;
-    memset(&cm, 0, sizeof(cm));
-    struct ClockmanPwmdiv cv;
-    memset(&cv, 0, sizeof(cv));
-
-    memcpy(&cm, &old_clockman_ctl, sizeof(uint32_t));
-    memcpy(&cv, &old_clockman_div, sizeof(uint32_t));
-
     // disable PWM
     {
      struct Ctl c;
@@ -153,6 +139,9 @@ static void init_pwm(void) {
     }
 
     // disable PWM clock
+    v = readl(pwm_regs.cman_pwmctl);
+    struct ClockmanPwmctl cm;
+    memcpy(&cm, &v, sizeof(cm));
     cm.enab = 0;
     cm.passwd = CLOCKMAN_PASSWORD;
     delay_writel(make_u32(cm), pwm_regs.cman_pwmctl);
@@ -164,6 +153,10 @@ static void init_pwm(void) {
       ((struct ClockmanPwmctl*)&v)->busy != 0) { }
 
     // source 6 = phase-locked loop D peripheral (PLLD)
+    v = readl(pwm_regs.cman_pwmdiv);
+    struct ClockmanPwmdiv cv;
+    memcpy(&cv, &v, sizeof(cm));
+
     cm.src = 6;
     cm.mash = 0;
     cv.divf = 0;
@@ -191,38 +184,48 @@ static void init_pwm(void) {
 }
 
 static int __init blaster_init(void) {
-    int ret = 0;
-    enabled = false;
-
-    ret = map_addresses();
-    if (ret < 0) {
-        printk(KERN_ERR "failed to map memory regions\n");
-        return ret;
-    }
-
     major_num = register_chrdev(0, DEVICE_NAME, &file_ops);
     if (major_num < 0) {
         printk(KERN_ERR "couldn't register dev major num: %d\n", major_num);
         return major_num;
     }
 
+    enabled = false;
+
     printk(KERN_INFO "blaster module loaded w major num %d\n", major_num);
+
+    memset(&pwm_regs, 0, sizeof(pwm_regs));
+    int ret = map_addresses();
+    if (ret < 0) {
+        printk(KERN_ERR "failed to map memory regions\n");
+        goto map_err;
+    }
 
     init_pwm();
     return 0;
+
+map_err:
+    unmap_all();
+    return ret;
+}
+
+static void unmap_all(void) {
+    #define SAFE_UNMAP(x, msg) \
+        if (x) { iounmap(x); x = NULL; printk(KERN_DEBUG "unmapped %s", msg); }
+    SAFE_UNMAP(pwm_regs.ctl, "pwm ctl");
+    SAFE_UNMAP(pwm_regs.cman_pwmctl, "cman ctl");
+    SAFE_UNMAP(pwm_regs.cman_pwmdiv, "cman div");
+    SAFE_UNMAP(pwm_regs.rng1, "rng");
+    SAFE_UNMAP(pwm_regs.dat1, "dat");
+    SAFE_UNMAP(pwm_regs.gpfsel1, "fsel");
+    #undef SAFE_UNMAP
 }
 
 static void __exit blaster_exit(void) {
-    unregister_chrdev(major_num, DEVICE_NAME);
     deinit_pwm();
-    #define SAFE_UNMAP(x) if (x) { iounmap(x); x = NULL; }
-    SAFE_UNMAP(pwm_regs.ctl);
-    SAFE_UNMAP(pwm_regs.cman_pwmctl);
-    SAFE_UNMAP(pwm_regs.cman_pwmdiv);
-    SAFE_UNMAP(pwm_regs.rng1);
-    SAFE_UNMAP(pwm_regs.dat1);
-    SAFE_UNMAP(pwm_regs.gpfsel1);
-    #undef SAFE_UNMAP
+    unmap_all();
+
+    unregister_chrdev(major_num, DEVICE_NAME);
 }
 
 static int map_addresses(void) {

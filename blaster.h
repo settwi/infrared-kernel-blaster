@@ -19,6 +19,7 @@ static ssize_t blaster_read(struct file*, char*, size_t, loff_t*);
 static ssize_t blaster_write(struct file*, const char*, size_t, loff_t*);
 
 static int map_addresses(void);
+static void unmap_all(void);
 static void init_pwm(void);
 static void deinit_pwm(void);
 static void check_sta(const char* msg);
