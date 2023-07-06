@@ -23,3 +23,6 @@ static void unmap_all(void);
 static void init_pwm(void);
 static void deinit_pwm(void);
 static void check_sta(const char* msg);
+static void toggle_pwm(void);
+
+static int isbad(int);

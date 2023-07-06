@@ -13,8 +13,6 @@ static uint32_t old_fsel;
 
 static bool enabled;
 
-#define delay_writel(a, b) writel(a, b) //{usleep_range(19000, 21000); writel(a, b);}
-
 static struct file_operations file_ops = {
     // set .owner so that we get auto lock/release
     .owner = THIS_MODULE,
@@ -37,7 +35,6 @@ static ssize_t blaster_read(
     struct PwmSta sta;
 
     memcpy(&sta, &reg, sizeof(uint32_t));
-    check_sta("just after read");
 
     local_enabled = sta.sta1;
     if (local_enabled) msg = "pwm on\n";
@@ -63,9 +60,7 @@ static ssize_t blaster_read(
     return bytes_read;
 }
 
-static ssize_t blaster_write(
-    struct file* f, const char* dat, size_t len, loff_t* off
-) {
+static void toggle_pwm(void) {
     enabled = !enabled;
     uint32_t v = readl(pwm_regs.ctl);
     struct Ctl c;
@@ -82,13 +77,65 @@ static ssize_t blaster_write(
     c.mode1 = 0;
     c.pwen1 = enabled;
 
-    delay_writel(make_u32(c), pwm_regs.ctl);
-    check_sta("just after write");
+    writel(make_u32(c), pwm_regs.ctl);
+}
 
-    printk(KERN_INFO "pwm write done\n");
-    // we don't care what the message is.
-    // signal to the OS that we are done
-    return len;
+static int isbad(int c) {
+    return 
+        (c > 0 && c < 32) ||
+        (c == 127)        ||
+        (c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r');
+}
+
+static ssize_t blaster_write(
+    struct file* f, const char* dat, size_t len, loff_t* off
+) {
+    // len of 1 means empty string
+    if (len == 1) {
+        return -EINVAL;
+    }
+
+    static const size_t MAX_MSG_SZ = 1024;
+    if (len > MAX_MSG_SZ) {
+        pr_err("message length is too long (max is %zu)\n", MAX_MSG_SZ);
+        return -EINVAL;
+    }
+
+    char* terminated = kmalloc(len * sizeof(char), GFP_KERNEL);
+    if (terminated == NULL) {
+        return -ENOMEM;
+    }
+
+    // the kernel sometimes pollutes the string and doesn't null-terminate it (??)
+    char* root = terminated;
+    memset(terminated, 0, len);
+    strncpy(terminated, dat, len-1);
+    while(isbad(*terminated)) { ++terminated; }
+
+    pr_info("string length: %zu\nstring: %s", len, terminated);
+
+    static const char
+        *TOG = "toggle",
+        *BLAST = "blast";
+
+    bool good = false;
+    if (strlen(TOG) < len && strncmp(terminated, TOG, strlen(TOG)) == 0) {
+        toggle_pwm();
+        good = true;
+        // bytes_read += strlen(TOG) + 1;
+    } else if (strlen(BLAST) < len && strncmp(terminated, BLAST, strlen(BLAST)) == 0) {
+        pr_info("BLAStOFF!!!\n");
+        good = true;
+        // bytes_read += strlen(BLAST) + 1;
+    }
+    else {
+        pr_err("invalid command '%s'\n", terminated);
+        good = false;
+    }
+
+    // pre-whitespace trim
+    kfree(root);
+    return good? len : -EINVAL;
 }
 
 static int blaster_open(struct inode* ino, struct file* f) {
@@ -108,10 +155,9 @@ static void deinit_pwm(void) {
     // disable pwm at exit
     struct Ctl c;
     memset(&c, 0, sizeof(struct Ctl));
-    delay_writel(make_u32(c), pwm_regs.ctl);
+    writel(make_u32(c), pwm_regs.ctl);
 
-    delay_writel(old_fsel, pwm_regs.gpfsel1);
-    check_sta("after set old gpio");
+    writel(old_fsel, pwm_regs.gpfsel1);
 }
 
 static void init_pwm(void) {
@@ -128,14 +174,13 @@ static void init_pwm(void) {
     // 4 = alt fun 0 aka PWM on GPIO#12
     // 2 = alt fun 5 aka PWM on GPIO#18
     fs.fsel12 = 4;
-    delay_writel(make_u32(fs), pwm_regs.gpfsel1);
-    check_sta("after set fsel");
+    writel(make_u32(fs), pwm_regs.gpfsel1);
 
     // disable PWM
     {
      struct Ctl c;
      memset(&c, 0, sizeof(struct Ctl));
-     delay_writel(make_u32(c), pwm_regs.ctl);
+     writel(make_u32(c), pwm_regs.ctl);
     }
 
     // disable PWM clock
@@ -144,8 +189,7 @@ static void init_pwm(void) {
     memcpy(&cm, &v, sizeof(cm));
     cm.enab = 0;
     cm.passwd = CLOCKMAN_PASSWORD;
-    delay_writel(make_u32(cm), pwm_regs.cman_pwmctl);
-    check_sta("after set clockman");
+    writel(make_u32(cm), pwm_regs.cman_pwmctl);
 
     // wait until "busy" flag is cleared
     while (
@@ -163,16 +207,12 @@ static void init_pwm(void) {
     cv.divi = 4080;
     cv.passwd = cm.passwd = CLOCKMAN_PASSWORD;
 
-    delay_writel(make_u32(cv), pwm_regs.cman_pwmdiv);
-    check_sta("after set div");
-    delay_writel(make_u32(cm), pwm_regs.cman_pwmctl);
-    check_sta("after set ctl");
+    writel(make_u32(cv), pwm_regs.cman_pwmdiv);
+    writel(make_u32(cm), pwm_regs.cman_pwmctl);
 
     // some duty cycle?
-    delay_writel(16, pwm_regs.dat1);
-    check_sta("after set data");
-    delay_writel(32, pwm_regs.rng1);
-    check_sta("after set range");
+    writel(16, pwm_regs.dat1);
+    writel(32, pwm_regs.rng1);
 
     // re-enable clock (but not the actual PWM)
     memset(&cm, 0, sizeof(cm));
@@ -180,7 +220,7 @@ static void init_pwm(void) {
     cm = *(struct ClockmanPwmctl*)&v;
     cm.passwd = CLOCKMAN_PASSWORD;
     cm.enab = 1;
-    delay_writel(make_u32(cm), pwm_regs.cman_pwmctl);
+    writel(make_u32(cm), pwm_regs.cman_pwmctl);
 }
 
 static int __init blaster_init(void) {
@@ -194,6 +234,7 @@ static int __init blaster_init(void) {
 
     printk(KERN_INFO "blaster module loaded w major num %d\n", major_num);
 
+    // zero out the registers (NULL pointers) before attempt
     memset(&pwm_regs, 0, sizeof(pwm_regs));
     int ret = map_addresses();
     if (ret < 0) {
@@ -316,7 +357,7 @@ static void check_sta(const char* msg) {
         pr_err("PWM bus error\n");
         sta.berr = 1;
     }
-    delay_writel(*(uint32_t*)&sta, pwm_regs.sta);
+    // writel(*(uint32_t*)&sta, pwm_regs.sta);
 }
 
 
