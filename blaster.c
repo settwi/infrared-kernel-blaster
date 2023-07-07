@@ -1,4 +1,5 @@
 #include "blaster.h"
+static bool check_sta(const char* msg);
 #include "pwm_bitfields.h"
 
 #define make_u32(x) (*(uint32_t*)&(x))
@@ -60,13 +61,11 @@ static ssize_t blaster_read(
     return bytes_read;
 }
 
-static void toggle_pwm(void) {
-    enabled = !enabled;
+static void toggle_pwm(bool state) {
     uint32_t v = readl(pwm_regs.ctl);
     struct Ctl c;
     memcpy(&c, &v, sizeof(uint32_t));
 
-    printk(KERN_DEBUG "pwm ctrl regs: %u", v);
     // see broadcom peripherals doc pg 143
     // don't care about channel 2
     c.msen1 = 1;
@@ -75,16 +74,63 @@ static void toggle_pwm(void) {
     c.pola1 = 0;
     c.sbit1 = 0;
     c.mode1 = 0;
-    c.pwen1 = enabled;
+    c.pwen1 = state;
 
     writel(make_u32(c), pwm_regs.ctl);
 }
 
-static int isbad(int c) {
-    return 
-        (c > 0 && c < 32) ||
-        (c == 127)        ||
-        (c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r');
+int hex_to_decimal(char hex_char) {
+    if (hex_char >= '0' && hex_char <= '9') {
+        return hex_char - '0';
+    }
+    if (hex_char >= 'a' && hex_char <= 'f') {
+        return hex_char - 'a' + 10;
+    }
+
+    return -EINVAL;
+}
+
+static bool ir_blast(char* to_blast) {
+    /* NOTE: MODIFIES THE ARGUMENT */
+    if (to_blast[0] == '\0') {
+        pr_err("empty string\n");
+        return false;
+    }
+
+    size_t i = 0;
+    while (isbad(to_blast[i])) {++i;}
+    const char* new_start = to_blast + i;
+
+    static const uint64_t DELAY_US = 693;
+    for (size_t j = 0; j < strlen(new_start); ++j) {
+        int blastme = hex_to_decimal(new_start[j]);
+        if (blastme < 0) return false;
+
+        #define NIBBLE 4
+        for (uint8_t k = 0; k < NIBBLE; ++k) {
+        #undef NIBBLE
+            uint8_t bit = blastme & (1 << k);
+            if (bit) {
+                toggle_pwm(true);
+                udelay(DELAY_US);
+            } 
+            else {
+                toggle_pwm(false);
+                udelay(DELAY_US);
+            }
+        }
+    }
+
+    return true;
+}
+
+static bool isbad(char c) {
+    bool is_whitespace = (
+            c == ' ' || c == '\t' || c == '\n' ||
+            c == '\v' || c == '\f' || c == '\r');
+    // exclude null terminator--it's a "good" char
+    bool is_unprintable = (c > 0 && c < 32) || (c == 127);
+    return is_whitespace || is_unprintable;
 }
 
 static ssize_t blaster_write(
@@ -93,6 +139,11 @@ static ssize_t blaster_write(
     // len of 1 means empty string
     if (len == 1) {
         return -EINVAL;
+    }
+
+    size_t real_len = len;
+    if (!isbad(dat[len-1])) {
+        real_len += 1;
     }
 
     static const size_t MAX_MSG_SZ = 1024;
@@ -108,32 +159,39 @@ static ssize_t blaster_write(
 
     // the kernel sometimes pollutes the string and doesn't null-terminate it (??)
     char* root = terminated;
-    memset(terminated, 0, len);
-    strncpy(terminated, dat, len-1);
-    while(isbad(*terminated)) { ++terminated; }
-
-    pr_info("string length: %zu\nstring: %s", len, terminated);
+    memset(terminated, '\0', real_len / sizeof(char));
+    memcpy(terminated, dat, real_len-1);
+    while(isbad(*terminated)) {
+        terminated += 1;
+    }
 
     static const char
         *TOG = "toggle",
         *BLAST = "blast";
+    static const size_t
+        TOGLEN = 6,
+        BLASTLEN = 5;
 
     bool good = false;
-    if (strlen(TOG) < len && strncmp(terminated, TOG, strlen(TOG)) == 0) {
-        toggle_pwm();
+    if (TOGLEN <= real_len && strncmp(terminated, TOG, TOGLEN) == 0) {
+        // should probably check for a bus error or other error...
+        // whatever
+        toggle_pwm((enabled = !enabled));
         good = true;
-        // bytes_read += strlen(TOG) + 1;
-    } else if (strlen(BLAST) < len && strncmp(terminated, BLAST, strlen(BLAST)) == 0) {
-        pr_info("BLAStOFF!!!\n");
-        good = true;
-        // bytes_read += strlen(BLAST) + 1;
+        //good = check_sta("pwm toggled");
+    } else if (BLASTLEN <= real_len && strncmp(terminated, BLAST, BLASTLEN) == 0) {
+        char* remainder = terminated + BLASTLEN + 1;
+        // force PWM off before transmission
+        toggle_pwm(false);
+        good = ir_blast(remainder);
+        toggle_pwm(false);
     }
     else {
         pr_err("invalid command '%s'\n", terminated);
         good = false;
     }
 
-    // pre-whitespace trim
+    // pre-whitespace trim variable (free all memory!)
     kfree(root);
     return good? len : -EINVAL;
 }
@@ -203,8 +261,11 @@ static void init_pwm(void) {
 
     cm.src = 6;
     cm.mash = 0;
-    cv.divf = 0;
-    cv.divi = 4080;
+    #define DIV_38KHZ 411
+    #define FDIV_38KHZ 189
+    cv.divi = DIV_38KHZ;
+    cv.divf = FDIV_38KHZ;
+    #undef DIV_38KHZ
     cv.passwd = cm.passwd = CLOCKMAN_PASSWORD;
 
     writel(make_u32(cv), pwm_regs.cman_pwmdiv);
@@ -232,8 +293,6 @@ static int __init blaster_init(void) {
 
     enabled = false;
 
-    printk(KERN_INFO "blaster module loaded w major num %d\n", major_num);
-
     // zero out the registers (NULL pointers) before attempt
     memset(&pwm_regs, 0, sizeof(pwm_regs));
     int ret = map_addresses();
@@ -252,7 +311,7 @@ map_err:
 
 static void unmap_all(void) {
     #define SAFE_UNMAP(x, msg) \
-        if (x) { iounmap(x); x = NULL; printk(KERN_DEBUG "unmapped %s", msg); }
+        if (x) { iounmap(x); x = NULL; }
     SAFE_UNMAP(pwm_regs.ctl, "pwm ctl");
     SAFE_UNMAP(pwm_regs.cman_pwmctl, "cman ctl");
     SAFE_UNMAP(pwm_regs.cman_pwmdiv, "cman div");
@@ -325,39 +384,12 @@ static int map_addresses(void) {
         printk(KERN_ERR "Failed to remap PWM1 function select regs\n");
         bad = 1;
     }
+
+    memcpy(&pwm_regs, &r, sizeof(r));
+
     if (bad) return -ENOMEM;
 
-    memset(&pwm_regs, 0, sizeof(struct PwmRegs));
-    memcpy(&pwm_regs, &r, sizeof(struct PwmRegs));
-
     return 0;
-}
-
-static void check_sta(const char* msg) {
-    uint32_t reg = readl(pwm_regs.sta);
-    struct PwmSta sta;
-    memcpy(&sta, &reg, sizeof(uint32_t));
-    printk(KERN_INFO "** %s **", msg);
-    printk(KERN_INFO "status register: %u\n", reg);
-
-    // set these to 1 to clear them when re-writing
-    if (sta.werr1) {
-        pr_err("PWM fifo1 read error\n");
-        sta.werr1 = 1;
-    }
-    if (sta.rerr1) {
-        pr_err("PWM fifo1 read error\n");
-        sta.rerr1 = 1;
-    }
-    if (sta.gapo1) {
-        pr_err("PWM fifo1 gap occurred\n");
-        sta.gapo1 = 1;
-    }
-    if (sta.berr) {
-        pr_err("PWM bus error\n");
-        sta.berr = 1;
-    }
-    // writel(*(uint32_t*)&sta, pwm_regs.sta);
 }
 
 
